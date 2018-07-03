@@ -1,7 +1,6 @@
-use {Call, CallRef, Httpc, RecvState, ResponseBody, SendState};
-use mio::Poll;
 use byteorder::{BigEndian, ByteOrder};
-use std::ascii::AsciiExt;
+use mio::Poll;
+use {Call, CallRef, Httpc, RecvState, ResponseBody, SendState};
 
 /// WebSocket packet received from server.
 pub enum WSPacket<'a> {
@@ -22,14 +21,14 @@ pub enum WSPacket<'a> {
     Close(Option<u16>, &'a [u8]),
 }
 
-impl<'a> WSPacket<'a> {
-    fn is_close(&self) -> bool {
-        match *self {
-            WSPacket::Close(_, _) => true,
-            _ => false,
-        }
-    }
-}
+// impl<'a> WSPacket<'a> {
+//     fn is_close(&self) -> bool {
+//         match *self {
+//             WSPacket::Close(_, _) => true,
+//             _ => false,
+//         }
+//     }
+// }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum State {
@@ -440,6 +439,7 @@ impl WebSocket {
         } else if self.state == State::Done {
             return Err(::Error::Closed);
         } else {
+            // htp.peek_body(&self.id, &mut self.recv_lover);
             self.perform(htp, poll)?;
         }
         self.read_packet(htp)
@@ -517,7 +517,7 @@ impl WebSocket {
         } else {
             0
         };
-        for i in 0..nb {
+        for _ in 0..nb {
             len <<= 8;
             len |= (*pkt.get(pos)?) as u64;
             pos += 1;
@@ -532,20 +532,12 @@ impl WebSocket {
         None
     }
 
-    fn switch(&mut self, htp: &mut Httpc, poll: &Poll, resp: ::Response<Vec<u8>>) -> ::Result<()> {
-        if resp.status().as_u16() != 101 {
+    fn switch(&mut self, htp: &mut Httpc, poll: &Poll, resp: ::Response) -> ::Result<()> {
+        if resp.status != 101 {
             self.stop(htp);
             return Err(::Error::WebSocketFail(resp));
         }
-        let mut is_wsupg = false;
-        if let Some(upg) = resp.headers().get(::UPGRADE) {
-            if let Ok(upg) = upg.to_str() {
-                if "websocket".eq_ignore_ascii_case(upg) {
-                    is_wsupg = true;
-                }
-            }
-        }
-        if !is_wsupg {
+        if !resp.ws {
             self.stop(htp);
             return Err(::Error::WebSocketFail(resp));
         }
@@ -595,7 +587,7 @@ impl WebSocket {
         if self.state == State::InitReceiving || self.state == State::Active {
             loop {
                 match htp.call_recv(poll, &mut self.id, None) {
-                    RecvState::DoneWithBody(b) => {
+                    RecvState::DoneWithBody(_b) => {
                         self.stop(htp);
                         return Err(::Error::Closed);
                     }
@@ -624,6 +616,12 @@ impl WebSocket {
                         break;
                     }
                     RecvState::ReceivedBody(_) => {}
+                }
+                // Since ws gets called in a loop rely on that for receiving
+                // Otherwise too much data can be received at the same time and
+                // buffers get inflated.
+                if self.state == State::Active {
+                    break;
                 }
             }
         }

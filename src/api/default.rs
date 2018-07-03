@@ -29,34 +29,22 @@ impl CallBuilder {
     }
 
     /// Start a GET request.
-    pub fn get<T>(uri: T) -> CallBuilder
-    where
-        Uri: HttpTryFrom<T>,
-    {
+    pub fn get(uri: &str) -> CallBuilder {
         CallBuilder::new()
     }
 
     /// Start a POST request.
-    pub fn post<T>(uri: T) -> CallBuilder
-    where
-        Uri: HttpTryFrom<T>,
-    {
+    pub fn post(uri: &str, body: Vec<u8>) -> CallBuilder {
         CallBuilder::new()
     }
 
     /// Start a PUT request.
-    pub fn put<T>(uri: T) -> CallBuilder
-    where
-        Uri: HttpTryFrom<T>,
-    {
+    pub fn put(uri: &str, body: Vec<u8>) -> CallBuilder {
         CallBuilder::new()
     }
 
     /// Start a DELETE request.
-    pub fn delete<T>(uri: T) -> CallBuilder
-    where
-        Uri: HttpTryFrom<T>,
-    {
+    pub fn delete(uri: &str) -> CallBuilder {
         CallBuilder::new()
     }
 
@@ -73,10 +61,7 @@ impl CallBuilder {
     }
 
     /// Set URI for call.
-    pub fn uri<T>(&mut self, uri: T) -> &mut Self
-    where
-        Uri: HttpTryFrom<T>,
-    {
+    pub fn uri(&mut self, uri: &str) -> &mut Self {
         self
     }
 
@@ -175,7 +160,7 @@ impl CallBuilder {
         self
     }
 
-    /// Default true.
+    /// Default secure.
     ///
     /// Turn off domain verification over ssl. This should only be used when testing as you are throwing away
     /// a big part of ssl security.
@@ -208,6 +193,9 @@ impl Httpc {
     pub fn open_connections(&self) -> usize {
         0
     }
+
+    /// Reconfigure client
+    pub fn recfg(&mut self, _cfg: ::HttpcCfg) {}
 
     /// Reuse a response buffer for subsequent calls.
     pub fn reuse(&mut self, buf: Vec<u8>) {}

@@ -1,41 +1,22 @@
+use call::CallImpl;
 use dns::{self, Dns};
 use dns_cache::DnsCache;
-use tls_api::{HandshakeError, MidHandshakeTlsStream, TlsConnector, TlsConnectorBuilder, TlsStream};
-use {CallRef, Result};
-use mio::net::TcpStream;
+use fnv::FnvHashMap as HashMap;
 use mio::event::Evented;
+use mio::net::TcpStream;
 use mio::{Poll, PollOpt, Ready, Token};
+use slab::Slab;
+use smallvec::SmallVec;
+use std::io::ErrorKind as IoErrorKind;
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
-use http::{Request, Uri};
-use std::io::{Read, Write};
-use types::{CallParam, RecvStateInt, SendStateInt};
-use fnv::FnvHashMap as HashMap;
-use smallvec::SmallVec;
-use call::CallImpl;
-use slab::Slab;
-
-fn url_port(url: &Uri) -> Result<u16> {
-    if let Some(p) = url.port() {
-        return Ok(p);
-    }
-    if let Some(scheme) = url.scheme_part() {
-        if scheme == "https" {
-            return Ok(443);
-        } else if scheme == "http" {
-            return Ok(80);
-        } else if scheme == "ws" {
-            return Ok(80);
-        } else if scheme == "wss" {
-            return Ok(443);
-        } else {
-            return Err(::Error::InvalidScheme);
-        }
-    } else {
-        return Err(::Error::InvalidScheme);
-    }
-}
+use tls_api::{
+    HandshakeError, MidHandshakeTlsStream, TlsConnector, TlsConnectorBuilder, TlsStream,
+};
+use types::{CallBuilderImpl, CallParam, RecvStateInt, SendStateInt};
+use {CallRef, Result};
 
 fn connect(addr: SocketAddr) -> Result<TcpStream> {
     let tcp = TcpStream::connect(&addr)?;
@@ -58,21 +39,23 @@ pub struct Con {
     to_close: bool,
     idle_since: Instant,
     insecure: bool,
-    signalled: bool,
+    signalled_rd: bool,
+    signalled_wr: bool,
+    is_tls: bool,
 }
 
 impl Con {
     pub fn new<C: TlsConnector, T>(
         token: Token,
-        req: &Request<T>,
+        cb: &CallBuilderImpl,
         cache: &mut DnsCache,
-        poll: &Poll,
+        // poll: &Poll,
         dns_timeout: u64,
         insecure: bool,
     ) -> Result<Con> {
         let rdy = Ready::writable();
-        let port = url_port(req.uri())?;
-        if req.uri().host().is_none() {
+        let port = cb.port; //url_port(req.uri())?;
+        if cb.bytes.host.len() == 0 {
             return Err(::Error::NoHost);
         }
         let mut res = Con {
@@ -85,11 +68,13 @@ impl Con {
             sock: None,
             dns: None,
             insecure,
-            host: ConHost::new(req.uri().host().unwrap().as_bytes()),
+            host: ConHost::new(&cb.bytes.host),
             idle_since: Instant::now(),
+            is_tls: cb.tls, //is_https(req.uri())?,
             tls: None,
             mid_tls: None,
-            signalled: false,
+            signalled_rd: true,
+            signalled_wr: true,
         };
         res.create_sock(cache)?;
         if res.sock.is_none() {
@@ -102,8 +87,12 @@ impl Con {
         &self.host
     }
 
-    pub fn update_token(&mut self, poll: &Poll, inc: usize) -> Result<()> {
-        self.token = Token(self.token.0 + inc);
+    pub fn update_token(&mut self, poll: &Poll, fixed: bool, v: usize) -> Result<()> {
+        self.token = if !fixed {
+            Token(self.token.0 + v)
+        } else {
+            Token(v)
+        };
         self.register(poll, self.token, self.reg_for, PollOpt::edge())?;
         Ok(())
     }
@@ -160,13 +149,13 @@ impl Con {
         false
     }
 
-    pub fn close(&mut self) {
-        self.sock = None;
-        self.tls = None;
-        // self.dns_sock = None;
-        self.dns = None;
-        self.is_closed = true;
-    }
+    // pub fn close(&mut self) {
+    //     self.sock = None;
+    //     self.tls = None;
+    //     // self.dns_sock = None;
+    //     self.dns = None;
+    //     self.is_closed = true;
+    // }
 
     #[inline]
     pub fn is_closed(&self) -> bool {
@@ -176,6 +165,7 @@ impl Con {
     pub fn is_first_use(&self) -> bool {
         self.first_use
     }
+    #[inline]
     pub fn set_idle(&mut self, b: bool) {
         self.first_use = false;
         if b {
@@ -183,16 +173,13 @@ impl Con {
         }
         // self.idle = b;
     }
+    #[inline]
     pub fn first_use_done(&mut self) {
         self.first_use = false;
     }
     #[inline]
     pub fn set_to_close(&mut self, b: bool) {
         self.to_close = b;
-    }
-    #[inline]
-    pub fn to_close(&self) -> bool {
-        self.to_close
     }
 
     pub fn reg(&mut self, poll: &Poll, rdy: Ready) -> ::std::io::Result<()> {
@@ -203,17 +190,40 @@ impl Con {
             self.reg_for = rdy;
             self.register(poll, self.token, self.reg_for, PollOpt::edge())
         } else {
-            self.reg_for |= rdy;
-            self.reregister(poll, self.token, self.reg_for, PollOpt::edge())
+            if !self.reg_for.contains(rdy) {
+                self.reg_for |= rdy;
+                return self.reregister(poll, self.token, self.reg_for, PollOpt::edge());
+            }
+            Ok(())
         }
+    }
+
+    #[inline]
+    pub fn is_signalled_rd(&self) -> bool {
+        self.signalled_rd
+    }
+
+    #[inline]
+    fn set_signalled_rd(&mut self, v: bool) {
+        self.signalled_rd = v;
+    }
+
+    #[inline]
+    pub fn is_signalled_wr(&self) -> bool {
+        self.signalled_wr
+    }
+
+    #[inline]
+    fn set_signalled_wr(&mut self, v: bool) {
+        self.signalled_wr = v;
     }
 
     pub fn signalled<'a, C: TlsConnector, T>(
         &mut self,
         cp: &mut CallParam,
-        req: &Request<T>,
+        req: &CallBuilderImpl,
     ) -> Result<()> {
-        if !self.signalled {
+        if !self.signalled_rd && !self.signalled_wr {
             return Ok(());
         }
         if self.dns.is_some() {
@@ -223,10 +233,9 @@ impl Con {
                 if let Some(ip) = dns::dns_parse(&buf[..sz]) {
                     // let host = req.uri().host().unwrap();
                     cp.dns.save(self.host.as_ref(), ip);
-                    let port = url_port(req.uri())?;
                     self.dns = None;
                     self.deregister(cp.poll)?;
-                    self.sock = Some(connect(SocketAddr::new(ip, port))?);
+                    self.sock = Some(connect(SocketAddr::new(ip, req.port))?);
                     self.reg_for = Ready::writable();
                     self.register(cp.poll, self.token, self.reg_for, PollOpt::edge())?;
 
@@ -235,9 +244,7 @@ impl Con {
             }
             self.dns = Some(dns);
         } else {
-            if self.sock.is_some() && self.con_port == 443 && self.tls.is_none()
-                && self.mid_tls.is_none()
-            {
+            if self.sock.is_some() && self.is_tls && self.tls.is_none() && self.mid_tls.is_none() {
                 let mut connector = C::builder()?;
                 for rca in cp.cfg.der_ca.iter() {
                     let _ = connector.add_der_certificate(rca);
@@ -245,15 +252,13 @@ impl Con {
                 for rca in cp.cfg.pem_ca.iter() {
                     let _ = connector.add_pem_certificate(rca);
                 }
+                if self.insecure {
+                    let _ = connector.danger_accept_invalid_certs();
+                }
                 let connector = connector.build()?;
                 self.reg(cp.poll, Ready::readable())?;
                 let tcp = self.sock.take().unwrap();
-
-                let r = if self.insecure {
-                    connector.danger_connect_without_providing_domain_for_certificate_verification_and_server_name_indication(tcp)
-                } else {
-                    connector.connect(self.host.as_ref(), tcp)
-                };
+                let r = connector.connect(self.host.as_ref(), tcp);
                 self.handshake_resp::<C>(r)?;
             }
             if self.mid_tls.is_some() {
@@ -287,31 +292,49 @@ impl Con {
 
 impl Read for Con {
     fn read(&mut self, buf: &mut [u8]) -> ::std::io::Result<usize> {
-        if let Some(ref mut tcp) = self.sock {
+        let res = if let Some(ref mut tcp) = self.sock {
             tcp.read(buf)
         } else if let Some(ref mut tls) = self.tls {
             tls.read(buf)
         } else {
-            Err(::std::io::Error::new(
+            return Err(::std::io::Error::new(
                 ::std::io::ErrorKind::WouldBlock,
                 "No socket",
-            ))
+            ));
+        };
+        match &res {
+            &Err(ref ie) => {
+                if ie.kind() == IoErrorKind::WouldBlock {
+                    self.set_signalled_rd(false);
+                }
+            }
+            _ => {}
         }
+        res
     }
 }
 
 impl Write for Con {
     fn write(&mut self, buf: &[u8]) -> ::std::io::Result<usize> {
-        if let Some(ref mut tcp) = self.sock {
+        let res = if let Some(ref mut tcp) = self.sock {
             tcp.write(buf)
         } else if let Some(ref mut tls) = self.tls {
             tls.write(buf)
         } else {
-            Err(::std::io::Error::new(
+            return Err(::std::io::Error::new(
                 ::std::io::ErrorKind::WouldBlock,
                 "No socket",
-            ))
+            ));
+        };
+        match &res {
+            &Err(ref ie) => {
+                if ie.kind() == IoErrorKind::WouldBlock {
+                    self.set_signalled_wr(false);
+                }
+            }
+            _ => {}
         }
+        res
     }
 
     fn flush(&mut self) -> ::std::io::Result<()> {
@@ -415,9 +438,10 @@ impl Eq for ConHost {}
 
 pub struct ConTable {
     cons: Slab<(Con, SmallVec<[CallImpl; 2]>)>,
+    // connections with fixed tokens
+    cons_fixed: HashMap<usize, (Con, CallImpl)>,
     // con that can be used for new requests
     keepalive: HashMap<ConHost, u16>,
-    empty_slots: usize,
 }
 
 impl ConTable {
@@ -425,7 +449,7 @@ impl ConTable {
         ConTable {
             keepalive: HashMap::with_capacity_and_hasher(4, Default::default()),
             cons: Slab::with_capacity(4),
-            empty_slots: 0,
+            cons_fixed: HashMap::with_capacity_and_hasher(4, Default::default()),
         }
     }
 
@@ -433,12 +457,30 @@ impl ConTable {
         self.cons.len()
     }
 
-    pub fn get_signalled_con(&mut self, id: usize) -> Option<&mut Con> {
+    pub fn signalled_con(&mut self, id: usize, rdy: Ready) -> bool {
         if let Some(t) = self.cons.get_mut(id) {
-            t.0.signalled = true;
-            return Some(&mut t.0);
+            if rdy.is_readable() {
+                t.0.set_signalled_rd(true);
+            }
+            if rdy.is_writable() {
+                t.0.set_signalled_wr(true);
+            }
+            return true;
         }
-        None
+        false
+    }
+
+    pub fn fixed_signalled_con(&mut self, k: usize, rdy: Ready) -> bool {
+        if let Some((con, _)) = self.cons_fixed.get_mut(&k) {
+            if rdy.is_readable() {
+                con.set_signalled_rd(true);
+            }
+            if rdy.is_writable() {
+                con.set_signalled_wr(true);
+            }
+            return true;
+        }
+        false
     }
 
     pub fn timeout_extend(&mut self, now: Instant, out: &mut Vec<CallRef>) {
@@ -450,7 +492,7 @@ impl ConTable {
             }
             if calls.len() == 0 {
                 if con.idle_timeout(now) {
-                    cons_to_close.push(call_id);
+                    cons_to_close.push(con_id as _);
                 }
                 continue;
             }
@@ -459,9 +501,11 @@ impl ConTable {
                     if now - call.start_time() >= call.settings().dur {
                         out.push(CallRef::new(con_id as u16, call_id));
                     } else if call_id == 0 {
-                        if let Some(host) = call.settings().req.uri().host() {
-                            con.timeout(now, host);
-                        }
+                        // if let Some(host) = call.settings().bytes.host() {
+                        let host =
+                            unsafe { ::std::str::from_utf8_unchecked(&call.settings().bytes.host) };
+                        con.timeout(now, host);
+                        // }
                     }
                 }
                 call_id += 1;
@@ -472,21 +516,41 @@ impl ConTable {
         }
     }
 
-    pub fn peek_body(&mut self, con: u16, call: u16, off: &mut usize) -> &[u8] {
+    pub fn peek_body(&mut self, call: &::Call, off: &mut usize) -> &[u8] {
+        if call.1 != usize::max_value() {
+            if let Some((_con, call)) = self.cons_fixed.get_mut(&call.1) {
+                return call.peek_body(off);
+            }
+            return &[];
+        }
+        let con = call.con_id() as usize;
+        let call = call.call_id() as usize;
         self.cons[con as usize].1[call as usize].peek_body(off)
     }
-    pub fn try_truncate(&mut self, con: u16, call: u16, off: &mut usize) {
+    pub fn try_truncate(&mut self, call: &::Call, off: &mut usize) {
+        if call.1 != usize::max_value() {
+            if let Some((_con, call)) = self.cons_fixed.get_mut(&call.1) {
+                call.try_truncate(off);
+            }
+            return;
+        }
+        let con = call.con_id() as usize;
+        let call = call.call_id() as usize;
         self.cons[con as usize].1[call as usize].try_truncate(off);
     }
     pub fn event_send<C: TlsConnector>(
         &mut self,
-        con: u16,
-        call: u16,
+        call: &::Call,
         cp: &mut CallParam,
         buf: Option<&[u8]>,
     ) -> Result<SendStateInt> {
-        let call = call as usize;
-        let con = con as usize;
+        if call.1 != usize::max_value() {
+            if let Some((con, call)) = self.cons_fixed.get_mut(&call.1) {
+                return call.event_send::<C>(con, cp, buf);
+            }
+        }
+        let con = call.con_id() as usize;
+        let call = call.call_id() as usize;
         let conp = &mut self.cons[con];
         let res = conp.1[call].event_send::<C>(&mut conp.0, cp, buf);
         if res.is_err() && !conp.0.is_first_use() && conp.1[call].can_retry() {
@@ -497,13 +561,17 @@ impl ConTable {
     }
     pub(crate) fn event_recv<C: TlsConnector>(
         &mut self,
-        con: u16,
-        call: u16,
+        call: &::Call,
         cp: &mut CallParam,
         buf: Option<&mut Vec<u8>>,
     ) -> Result<RecvStateInt> {
-        let call = call as usize;
-        let con = con as usize;
+        if call.1 != usize::max_value() {
+            if let Some((con, call)) = self.cons_fixed.get_mut(&call.1) {
+                return call.event_recv::<C>(con, cp, buf);
+            }
+        }
+        let con = call.con_id() as usize;
+        let call = call.call_id() as usize;
         let conp = &mut self.cons[con];
         let res = conp.1[call].event_recv::<C>(&mut conp.0, cp, buf);
         if res.is_err() && !conp.0.is_first_use() && conp.1[call].can_retry() {
@@ -513,27 +581,32 @@ impl ConTable {
         res
     }
 
+    pub fn add_fixed_con(&mut self, mut c: Con, call: CallImpl, poll: &Poll) -> Result<()> {
+        c.update_token(poll, true, call.settings().evid)?;
+        self.cons_fixed.insert(call.settings().evid, (c, call));
+        Ok(())
+    }
+
     pub fn push_con(&mut self, mut c: Con, call: CallImpl, poll: &Poll) -> Result<Option<u16>> {
         if self.cons.len() == (u16::max_value() as usize) {
             return Ok(None);
         }
         let entry = self.cons.vacant_entry();
         let key = entry.key();
-        c.update_token(poll, key)?;
+        c.update_token(poll, false, key)?;
         let mut v = SmallVec::new();
         v.push(call);
         entry.insert((c, v));
         Ok(Some(key as u16))
     }
 
-    pub fn push_ka_con(&mut self, con: u16, call: CallImpl, poll: &Poll) -> Result<()> {
-        // self.cons[con as usize].0.update_token(poll, con as usize)?;
+    pub fn push_ka_con(&mut self, con: u16, call: CallImpl) -> Result<()> {
         self.cons[con as usize].1.push(call);
         Ok(())
     }
 
-    fn extract_call(callid: u16, calls: &mut SmallVec<[CallImpl; 2]>) -> CallImpl {
-        let callid = callid as usize;
+    fn extract_call(call: ::Call, calls: &mut SmallVec<[CallImpl; 2]>) -> CallImpl {
+        let callid = call.call_id() as usize;
         if callid + 1 == calls.len() {
             let res = calls.pop();
             while calls.last().is_some() {
@@ -549,10 +622,9 @@ impl ConTable {
         }
     }
 
-    pub fn try_keepalive(&mut self, host: &str, poll: &Poll) -> Option<u16> {
-        // let mut cons_to_close: SmallVec<[u16; 16]> = SmallVec::new();
+    pub fn try_keepalive(&mut self, host: &[u8], poll: &Poll) -> Option<u16> {
         let con_to_close;
-        let nh = ConHost::new(host.as_bytes());
+        let nh = ConHost::new(host);
         if let Some(con) = self.keepalive.remove(&nh) {
             self.cons[con as usize].0.set_idle(false);
             if self.cons[con as usize].0.reuse(poll).is_ok() {
@@ -567,20 +639,25 @@ impl ConTable {
         None
     }
 
-    pub fn close_call(&mut self, con: u16, call: u16) -> (::types::CallBuilderImpl, Vec<u8>) {
-        let con = con as usize;
+    pub fn close_call(&mut self, call: ::Call) -> (::types::CallBuilderImpl, Vec<u8>, Vec<u8>) {
+        if call.1 != usize::max_value() {
+            if let Some((_con, call)) = self.cons_fixed.remove(&call.1) {
+                return call.stop();
+            }
+        }
+        let con = call.con_id() as usize;
         let call: CallImpl = Self::extract_call(call, &mut self.cons[con].1);
-        let (builder, call_buf) = call.stop();
-        // println!("close_call {} {} {}",con, self.cons[con].0.to_close, self.cons.len());
+        let (builder, hdr_buf, body_buf) = call.stop();
+        // println!("close_call {} toclose={} {}",con, self.cons[con].0.to_close, self.cons.len());
         {
-            let uri = builder.req.uri();
-            if !self.cons[con].0.to_close && uri.host().is_some() {
+            let host = &builder.bytes.host;
+            if !self.cons[con].0.to_close {
                 if self.cons[con].1.len() == 0 {
                     self.cons[con].0.set_idle(true);
                 } else {
                     self.cons[con].0.first_use_done();
                 }
-                let nh = ConHost::new(uri.host().unwrap().as_bytes());
+                let nh = ConHost::new(host);
                 if self.keepalive.contains_key(&nh) {
                     let mut doclose = false;
                     {
@@ -600,7 +677,7 @@ impl ConTable {
                 self.close_con(con);
             }
         }
-        (builder, call_buf)
+        (builder, hdr_buf, body_buf)
     }
 
     fn close_con(&mut self, toclose: usize) {

@@ -10,14 +10,16 @@ pub mod native;
 #[allow(dead_code, unused_variables)]
 pub mod openssl;
 
-use std::io;
+#[cfg(not(any(feature = "rustls", feature = "native", feature = "openssl")))]
+pub mod dummy;
+
 use std::fmt;
+use std::io;
 // use std::error;
 use std::result;
 use {Error, Result};
 
-pub trait TlsStreamImpl<S>
-    : io::Read + io::Write + fmt::Debug + Send + Sync + 'static {
+pub trait TlsStreamImpl<S>: io::Read + io::Write + fmt::Debug + Send + Sync + 'static {
     /// Get negotiated ALPN protocol.
     fn get_alpn_protocol(&self) -> Option<Vec<u8>>;
 
@@ -125,6 +127,8 @@ pub trait TlsConnectorBuilder: Sized + Sync + Send + 'static {
     fn add_der_certificate(&mut self, cert: &[u8]) -> Result<&mut Self>;
     fn add_pem_certificate(&mut self, cert: &[u8]) -> Result<&mut Self>;
 
+    fn danger_accept_invalid_certs(&mut self) -> Result<&mut Self>;
+
     fn build(self) -> Result<Self::Connector>;
 }
 
@@ -146,14 +150,14 @@ pub trait TlsConnector: Sized + Sync + Send + 'static {
     where
         S: io::Read + io::Write + fmt::Debug + Send + Sync + 'static;
 
-    fn danger_connect_without_providing_domain_for_certificate_verification_and_server_name_indication<
-        S,
-    >(
-        &self,
-        stream: S,
-    ) -> result::Result<TlsStream<S>, HandshakeError<S>>
-    where
-        S: io::Read + io::Write + fmt::Debug + Send + Sync + 'static;
+    // fn danger_connect_without_providing_domain_for_certificate_verification_and_server_name_indication<
+    //     S,
+    // >(
+    //     &self,
+    //     stream: S,
+    // ) -> result::Result<TlsStream<S>, HandshakeError<S>>
+    // where
+    //     S: io::Read + io::Write + fmt::Debug + Send + Sync + 'static;
 }
 
 /// A builder for `TlsAcceptor`s.

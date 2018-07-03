@@ -1,9 +1,15 @@
+use std::ffi::OsStr;
+use std::fmt::{Display, Error as FmtError, Formatter};
+use std::fs;
+use std::io::Read;
+use std::str::from_utf8;
+
 /// Used when call is in send request state.
 #[derive(Debug)]
 pub enum SendState {
     /// Unrecoverable error has occured and call is finished.
     Error(::Error),
-    /// How many bytes of body have been sent.
+    /// How many bytes of body have just been sent.
     SentBody(usize),
     /// Waiting for body to be provided for sending.
     WaitReqBody,
@@ -16,18 +22,151 @@ pub enum SendState {
     Wait,
 }
 
-/// Top level configuration for mio_http. For now just additional root ssl certificates.
-#[derive(Default)]
+#[derive(Default, Debug)]
+pub struct Response {
+    pub(crate) hdrs: Vec<u8>,
+    pub status: u16,
+    pub(crate) ws: bool,
+}
+impl Response {
+    pub(crate) fn new() -> Response {
+        Response {
+            ..Default::default()
+        }
+    }
+
+    pub fn headers(&self) -> Headers {
+        let mut raw = [::httparse::EMPTY_HEADER; 32];
+        let mut out = Headers::new();
+        {
+            let mut presp = ::httparse::Response::new(&mut raw);
+            let _ = presp.parse(&self.hdrs);
+        }
+        let mut pos = 0;
+        for i in 0..raw.len() {
+            if raw[i].name.len() == 0 {
+                break;
+            }
+            if let Ok(v) = from_utf8(raw[i].value) {
+                out.headers[pos] = Header::new(raw[i].name, v);
+                pos += 1;
+                out.len = pos;
+            }
+        }
+        out
+    }
+}
+
+/// A single header
+#[derive(Default, Copy, Clone)]
+pub struct Header<'a> {
+    pub name: &'a str,
+    pub value: &'a str,
+}
+impl<'a> Header<'a> {
+    fn new(n: &'a str, v: &'a str) -> Header<'a> {
+        Header { name: n, value: v }
+    }
+
+    /// Case insensitive header name comparison
+    pub fn is(&self, v: &str) -> bool {
+        self.name.eq_ignore_ascii_case(v)
+    }
+}
+impl<'a> Display for Header<'a> {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), FmtError> {
+        write!(f, "[ {}: {} ]", self.name, self.value)
+    }
+}
+
+/// Iterator over headers in response
+#[derive(Default, Copy, Clone)]
+pub struct Headers<'a> {
+    headers: [Header<'a>; 32],
+    len: usize,
+    next: usize,
+}
+impl<'a> Headers<'a> {
+    fn new() -> Headers<'a> {
+        Default::default()
+    }
+}
+
+impl<'a> Display for Headers<'a> {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), FmtError> {
+        for h in 0..self.len {
+            self.headers[h].fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Iterator for Headers<'a> {
+    type Item = Header<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.len {
+            return None;
+        }
+        self.next += 1;
+        Some(self.headers[self.next - 1])
+    }
+}
+
+/// Top level configuration for mio_http.
+#[derive(Default, Clone)]
 pub struct HttpcCfg {
-    // Extra root certificates in der format
+    /// Extra root certificates in der format.
     pub der_ca: Vec<Vec<u8>>,
-    // Extra root certificates in pem format
+    /// Extra root certificates in pem format.
     pub pem_ca: Vec<Vec<u8>>,
+    /// Default: 8
+    ///
+    /// Max 8K buffers to keep cached for subsequent requests.
+    /// Every request requires 2.
+    pub cache_buffers: usize,
 }
 
 impl HttpcCfg {
     pub fn new() -> HttpcCfg {
-        Default::default()
+        HttpcCfg {
+            cache_buffers: 8,
+            ..Default::default()
+        }
+    }
+
+    /// Will read pem files (extensions .crt or .pem) from path.
+    /// Path can be to file or folder.
+    pub fn certs_from_path(path: &str) -> ::std::io::Result<HttpcCfg> {
+        let mut cfg = HttpcCfg::new();
+        let certs = [OsStr::new("crt"), OsStr::new("pem")];
+        let metadata = fs::metadata(path)?;
+        if metadata.is_file() {
+            let mut file = fs::File::open(path)?;
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+            cfg.pem_ca.push(contents);
+            return Ok(cfg);
+        }
+        for de in fs::read_dir(path)? {
+            if de.is_err() {
+                continue;
+            }
+            let de = de.unwrap();
+            match de.path().extension() {
+                Some(ex) if certs.contains(&ex) => {
+                    let meta = fs::metadata(de.path())?;
+                    if meta.len() < 1024 * 8 {
+                        let mut file = fs::File::open(de.path())?;
+                        let mut contents = Vec::new();
+                        file.read_to_end(&mut contents)?;
+                        cfg.pem_ca.push(contents);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(cfg)
     }
 }
 
@@ -61,7 +200,7 @@ pub enum RecvState {
     Error(::Error),
     /// HTTP Response and response body size.
     /// If there is a body it will follow, otherwise call is done.
-    Response(::http::Response<Vec<u8>>, ResponseBody),
+    Response(Response, ResponseBody),
     /// How many bytes were received.
     ReceivedBody(usize),
     /// Request is done with body.
@@ -78,12 +217,12 @@ pub enum RecvState {
 
 /// Call structure.
 #[derive(Debug, PartialEq)] // much fewer derives then ref on purpose. We want a single instance.
-pub struct Call(pub(crate) u32);
+pub struct Call(pub(crate) u32, pub(crate) usize);
 
 impl Call {
     /// Get a CallRef that matches this call.
     pub fn get_ref(&self) -> CallRef {
-        CallRef(self.0)
+        CallRef(self.0, self.1)
     }
 
     pub fn simple(self) -> SimpleCall {
@@ -98,11 +237,11 @@ impl Call {
     pub(crate) fn new(con_id: u16, call_id: u16) -> Call {
         let con_id = con_id as u32;
         let call_id = call_id as u32;
-        Call((call_id << 16) | con_id)
+        Call((call_id << 16) | con_id, usize::max_value())
     }
 
     pub(crate) fn empty() -> Call {
-        Call(0xffff_ffff)
+        Call(0xffff_ffff, usize::max_value())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -134,39 +273,26 @@ impl Call {
 /// If you have lots of calls, you can use this as a key in a HashMap
 /// (you probably want fnv HashMap).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CallRef(pub(crate) u32);
+pub struct CallRef(pub(crate) u32, pub(crate) usize);
 impl CallRef {
     // (Call:16, Con:16)
     pub(crate) fn new(con_id: u16, call_id: u16) -> CallRef {
         let con_id = con_id as u32;
         let call_id = call_id as u32;
-        CallRef((call_id << 16) | con_id)
+        CallRef((call_id << 16) | con_id, usize::max_value())
     }
 
-    pub(crate) fn con_id(&self) -> u16 {
-        (self.0 & 0xFFFF) as u16
-    }
+    // pub(crate) fn con_id(&self) -> u16 {
+    //     (self.0 & 0xFFFF) as u16
+    // }
 }
 
-/// Extract body from http::Response
-pub fn extract_body(r: &mut ::http::Response<Vec<u8>>) -> Vec<u8> {
-    ::std::mem::replace(r.body_mut(), Vec::new())
-}
 #[allow(unused_imports)]
 mod websocket;
 pub use self::websocket::*;
 
 mod simple_call;
 pub use self::simple_call::*;
-mod sync;
-pub use self::sync::*;
 
-#[cfg(not(any(feature = "rustls", feature = "native", feature = "openssl")))]
-mod default;
-#[cfg(not(any(feature = "rustls", feature = "native", feature = "openssl")))]
-pub use self::default::*;
-
-#[cfg(any(feature = "rustls", feature = "native", feature = "openssl"))]
 mod builder;
-#[cfg(any(feature = "rustls", feature = "native", feature = "openssl"))]
 pub use self::builder::*;

@@ -1,8 +1,8 @@
 extern crate mio;
 extern crate mio_httpc;
 
-use mio_httpc::{CallBuilder, Httpc, HttpcCfg, SimpleCall};
 use mio::{Events, Poll};
+use mio_httpc::{CallBuilder, Httpc, HttpcCfg, SimpleCall};
 
 fn do_call(htp: &mut Httpc, poll: &Poll, mut call: SimpleCall) {
     let to = ::std::time::Duration::from_millis(100);
@@ -21,14 +21,15 @@ fn do_call(htp: &mut Httpc, poll: &Poll, mut call: SimpleCall) {
 
             if call.is_call(&cref) {
                 if call.perform(htp, &poll).expect("Call failed") {
-                    let mut resp = call.finish().expect("No response");
-                    // println!("done req");
-                    println!("Headers={:?}", resp.headers());
-                    let v = mio_httpc::extract_body(&mut resp);
-                    if let Ok(s) = String::from_utf8(v.clone()) {
+                    let (resp, body) = call.finish().expect("No response");
+                    println!("done req = {}", resp.status);
+                    for h in resp.headers() {
+                        println!("Header={}", h);
+                    }
+                    if let Ok(s) = String::from_utf8(body.clone()) {
                         println!("Body: {}", s);
                     } else {
-                        println!("Non utf8 body sized: {}", v.len());
+                        println!("Non utf8 body sized: {}", body.len());
                     }
                     break 'outer;
                 }
@@ -39,9 +40,13 @@ fn do_call(htp: &mut Httpc, poll: &Poll, mut call: SimpleCall) {
 
 fn main() {
     let poll = Poll::new().unwrap();
-    let args: Vec<String> = ::std::env::args().collect();
+    let mut args: Vec<String> = ::std::env::args().collect();
 
-    let cfg = if let Ok(cfg) = read_certs() {
+    if args.len() == 1 {
+        args.push("https://www.reddit.com".to_string());
+    }
+
+    let cfg = if let Ok(cfg) = HttpcCfg::certs_from_path(".") {
         Some(cfg)
     } else {
         None
@@ -50,45 +55,16 @@ fn main() {
 
     for i in 1..args.len() {
         println!("Get {}", args[i].as_str());
-        let call = CallBuilder::get(args[i].as_str())
+        let call = CallBuilder::get()
+            .url(args[i].as_str())
+            .expect("Invalid url")
             .timeout_ms(10000)
             .digest_auth(true)
-            // .insecure_do_not_verify_domain()
+            .insecure_do_not_verify_domain()
             .simple_call(&mut htp, &poll)
             .expect("Call start failed");
         do_call(&mut htp, &poll, call);
 
         println!("Open connections={}", htp.open_connections());
     }
-}
-
-use std::fs::{read_dir, File};
-use std::ffi::OsStr;
-use std::io::Read;
-
-fn read_certs() -> ::std::io::Result<HttpcCfg> {
-    let mut cfg = HttpcCfg::new();
-    let certs = [OsStr::new("crt"), OsStr::new("pem")];
-    let der = [OsStr::new("der")];
-    for de in read_dir(".")? {
-        let de = de?;
-        match de.path().extension() {
-            Some(ex) if der.contains(&ex) => {
-                println!("Adding {:?}", de.path());
-                let mut file = File::open(de.path())?;
-                let mut contents = Vec::new();
-                file.read_to_end(&mut contents)?;
-                cfg.der_ca.push(contents);
-            }
-            Some(ex) if certs.contains(&ex) => {
-                println!("Adding {:?}", de.path());
-                let mut file = File::open(de.path())?;
-                let mut contents = Vec::new();
-                file.read_to_end(&mut contents)?;
-                cfg.pem_ca.push(contents);
-            }
-            _ => {}
-        }
-    }
-    Ok(cfg)
 }

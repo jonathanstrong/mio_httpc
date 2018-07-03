@@ -1,6 +1,6 @@
 extern crate mio_httpc;
 
-use mio_httpc::SyncCall;
+use mio_httpc::CallBuilder;
 
 fn main() {
     let args: Vec<String> = ::std::env::args().collect();
@@ -10,13 +10,18 @@ fn main() {
         args[1].as_str()
     };
 
-    println!("Calling: {}",uri);
+    println!("Calling: {}", uri);
 
-    let (status, hdrs, body) = SyncCall::new().timeout_ms(5000).get(uri).expect("Request failed");
+    let (resp, body) = CallBuilder::get()
+        .timeout_ms(5000)
+        .url(uri)
+        .expect("Invalid url")
+        .exec()
+        .expect("Request failed");
 
-    println!("Status={}", status);
-    println!("Hdrs={:?}", hdrs);
+    println!("Status={}", resp.status);
+    println!("Hdrs={}", resp.headers());
     if let Ok(s) = String::from_utf8(body) {
-        println!("Body: {}",s);
+        println!("Body: {}", s);
     }
 }

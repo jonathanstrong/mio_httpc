@@ -13,7 +13,7 @@ enum State {
 pub struct SimpleCall {
     state: State,
     id: Call,
-    resp: Option<::http::Response<Vec<u8>>>,
+    resp: Option<::Response>,
     resp_body: Option<Vec<u8>>,
 }
 
@@ -27,20 +27,21 @@ impl SimpleCall {
     }
 
     /// Replaces self with an empty SimpleCall and returns result if any.
-    pub fn finish_inplace(&mut self) -> Option<::http::Response<Vec<u8>>> {
+    pub fn finish_inplace(&mut self) -> Option<(::Response, Vec<u8>)> {
         let out = ::std::mem::replace(self, SimpleCall::empty());
         out.finish()
     }
 
     /// Consume and return response with body.
-    pub fn finish(mut self) -> Option<::http::Response<Vec<u8>>> {
+    pub fn finish(mut self) -> Option<(::Response, Vec<u8>)> {
         let r = self.resp.take();
         let b = self.resp_body.take();
-        if let Some(mut rs) = r {
+        if let Some(rs) = r {
             if let Some(rb) = b {
-                ::std::mem::replace(rs.body_mut(), rb);
+                // ::std::mem::replace(rs.body_mut(), rb);
+                return Some((rs, rb));
             }
-            return Some(rs);
+            return Some((rs, Vec::new()));
         }
         None
     }
@@ -79,6 +80,11 @@ impl SimpleCall {
     /// Is request finished.
     pub fn is_done(&self) -> bool {
         self.state == State::Done
+    }
+
+    /// Are we in receiving state
+    pub fn is_receiving(&self) -> bool {
+        self.state == State::Receiving
     }
 
     /// Perform operation. Returns true if request is finished.
