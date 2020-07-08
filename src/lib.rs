@@ -14,7 +14,7 @@
 //!
 //! # Examples
 //!
-//! ```no_run
+//! ```ignore
 //! extern crate mio_httpc;
 //! extern crate mio;
 //!
@@ -56,7 +56,7 @@
 //! }
 //! ```
 //!
-//! ```no_run
+//! ```ignore
 //! extern crate mio_httpc;
 //! use mio_httpc::CallBuilder;
 //!
@@ -67,6 +67,7 @@
 //! ```
 #![doc(html_root_url = "https://docs.rs/mio_httpc")]
 #![crate_name = "mio_httpc"]
+#![allow(deprecated)]
 
 extern crate httparse;
 extern crate rand;

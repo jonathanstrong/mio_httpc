@@ -1,6 +1,6 @@
 use crate::call::CallImpl;
 use crate::connection::{Con, ConTable};
-use mio::{Event, Poll, Token};
+use mio::{event::Event, Poll, Token};
 use crate::resolve::DnsCache;
 use std::collections::VecDeque;
 use crate::tls_api::TlsConnector;

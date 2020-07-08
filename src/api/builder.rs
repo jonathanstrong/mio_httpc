@@ -3,7 +3,8 @@ use crate::tls_api::TlsConnector;
 use crate::types::{CallBuilderImpl, Method};
 use crate::SimpleCall;
 use crate::{Call, CallRef, Result};
-use mio::{Event, Poll};
+use mio::Poll;
+use mio::event::Event;
 
 /// Used to start a call and get a Call for it.
 #[derive(Debug, Default)]
